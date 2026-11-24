@@ -624,9 +624,20 @@ fn texture_srv_desc(
         DXGI_FORMAT_R16_TYPELESS => (DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, None),
         _ => return view,
     };
+    // The console keeps 32-bit depth and stencil as separate R32 and R8
+    // surfaces, and lets shaders view them as such (R32_FLOAT, R8_UINT):
+    // here they are the depth and stencil planes of one texture.
+    let separate = resource.Format == DXGI_FORMAT_R32G8X24_TYPELESS;
     let plane = if Some(view.Format) == stencil {
         1
-    } else if [DXGI_FORMAT_UNKNOWN, resource.Format, dsv, depth].contains(&view.Format) {
+    } else if separate && [DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_TYPELESS].contains(&view.Format) {
+        // The stencil plane's view reads stencil in its second component.
+        view.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+        view.Shader4ComponentMapping = from_green(view.Shader4ComponentMapping);
+        1
+    } else if [DXGI_FORMAT_UNKNOWN, resource.Format, dsv, depth].contains(&view.Format)
+        || separate && [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS].contains(&view.Format)
+    {
         view.Format = depth;
         0
     } else {
@@ -638,6 +649,25 @@ fn texture_srv_desc(
         _ => {}
     }
     view
+}
+
+/// A component mapping for a one-channel view (R8) of data that is in the
+/// second channel of the host's view: the first channel comes from the
+/// second, the other channels a one-channel view does not have read 0 (1 for
+/// alpha), as they would; forced values stay.
+fn from_green(mapping: u32) -> u32 {
+    const ALWAYS: u32 = 1 << 12;
+    const ZERO: u32 = 4;
+    const ONE: u32 = 5;
+    (0..4).fold(ALWAYS, |m, c| {
+        let source = match (mapping >> (3 * c)) & 7 {
+            0 => 1,
+            1 | 2 => ZERO,
+            3 => ONE,
+            forced => forced,
+        };
+        m | source << (3 * c)
+    })
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -903,6 +933,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_channel_stencil_views_read_the_second_channel() {
+        // Default mapping (r, g, b, a) reads (stencil, 0, 0, 1).
+        assert_eq!(
+            from_green(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING),
+            0x1000 | 1 | 4 << 3 | 4 << 6 | 5 << 9
+        );
+        // Stencil everywhere (r, r, r, r), and forced values, stay as asked.
+        assert_eq!(from_green(0x1000), 0x1000 | 0o1111);
+        assert_eq!(
+            from_green(0x1000 | 4 | 5 << 3),
+            0x1000 | 4 | 5 << 3 | 1 << 6 | 1 << 9
+        );
+    }
+
+    #[test]
     fn depth_srv_uses_the_requested_aspect() {
         for (own, request, expected, plane) in [
             (19, 20, 21, 0),
@@ -915,6 +960,10 @@ mod tests {
             (53, 55, 56, 0),
             (19, 0, 21, 0),
             (44, 44, 46, 0),
+            (19, 41, 21, 0),
+            (19, 39, 21, 0),
+            (19, 62, 22, 1),
+            (19, 60, 22, 1),
         ] {
             let resource = D3D12_RESOURCE_DESC {
                 Format: DXGI_FORMAT(own),

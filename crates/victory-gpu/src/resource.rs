@@ -1783,6 +1783,187 @@ mod tests {
         }
     }
 
+    /// What a shader reads through a title's shader views of 32-bit depth
+    /// with stencil (depth cleared to 0.25, stencil to 0x5a): the PC views
+    /// of either plane, and the console's views of its separate surfaces,
+    /// R32_FLOAT for depth and R8_UINT for stencil, which read the same.
+    #[cfg(windows)]
+    #[test]
+    fn depth_with_stencil_shader_views_read_both_planes() {
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+        let Some(host) = crate::host::host() else {
+            eprintln!("probe: no host GPU");
+            return;
+        };
+        let null: This = std::ptr::null();
+        let mut depth = null;
+        let desc = ResourceDesc {
+            flags: 2,
+            ..texture(8, 8, 20, 1)
+        };
+        const DEPTH_WRITE: u32 = 0x10;
+        let made = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &desc,
+            DEPTH_WRITE,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut depth,
+        );
+        assert_eq!(made, S_OK);
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, depth, DEPTH_WRITE);
+        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let dsv = host.dsv(host_resource(depth).unwrap(), Some(&dsv));
+        // SAFETY: an open list and a fresh view.
+        unsafe {
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                0.25,
+                0x5a,
+                None,
+            )
+        };
+        list.close();
+        host.execute(&[&list]);
+
+        const READ: &str = r#"
+Texture2D<float4> f : register(t0);
+Texture2D<uint4> u : register(t1);
+RWStructuredBuffer<uint4> o : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    o[0] = asuint(f.Load(int3(3, 3, 0)));
+    o[1] = u.Load(int3(3, 3, 0));
+}
+"#;
+        let range = [
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                ..Default::default()
+            },
+        ];
+        let parameters = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: range.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR::default(),
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let signature = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 2,
+            pParameters: parameters.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: descriptions and source live through the calls; blobs'
+        // own bytes.
+        let (root, pso) = unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+                .unwrap();
+            let blob = blob.unwrap();
+            let bytes =
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let mut code: Option<ID3DBlob> = None;
+            D3DCompile(
+                READ.as_ptr().cast(),
+                READ.len(),
+                s!("read"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_0"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+            let code = code.unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        // (format, plane) for the float view, then the uint view, and the
+        // stencil's component in the uint view.
+        let cases: [((u32, u32), (u32, u32), usize); 2] = [
+            ((21, 0), (22, 1), 1), // PC: R32_FLOAT_X8X24, X32_G8X24_UINT
+            ((41, 0), (62, 1), 0), // console: R32_FLOAT, R8_UINT
+        ];
+        for ((ff, fp), (uf, up), at) in cases {
+            let heap = crate::descriptor::host::HostHeap::new(false, 2).unwrap();
+            for (slot, (format, plane)) in [(0, (ff, fp)), (1, (uf, up))] {
+                let mut words = [0u32; 10];
+                words[0] = format;
+                words[1] = 4; // TEXTURE2D
+                words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                words[5] = 1; // MipLevels
+                words[6] = plane;
+                heap.make_at(
+                    slot,
+                    &crate::descriptor::View::Shader(depth as usize, Some(words)),
+                );
+            }
+            let (out, data) = host.shared_buffer(256).unwrap();
+            // SAFETY: our mapping of 256 bytes.
+            unsafe { std::ptr::write_bytes(data, 0xcd, 256) };
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, depth, 0x40 | 0x80);
+            // SAFETY: an open list; our heap, root signature, pipeline.
+            unsafe {
+                let l = &list.list;
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
+                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch finished; 32 bytes written.
+            let w = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 8) };
+            eprintln!("views f{ff}/{fp} and f{uf}/{up} read {w:#x?}");
+            assert_eq!(f32::from_bits(w[0]), 0.25, "depth through f{ff}");
+            assert_eq!(w[4 + at], 0x5a, "stencil through f{uf}");
+            if uf == 62 {
+                // What an R8_UINT view has: stencil, 0, 0, 1.
+                assert_eq!(&w[4..8], &[0x5a, 0, 0, 1]);
+            }
+        }
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
